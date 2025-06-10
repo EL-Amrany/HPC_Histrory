@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="text-center mt-5">
+  <h1>Welcome to the HPC Learning App</h1>
+  <p>Explore and learn High-Performance Computing at your own pace.</p>
+  
+  <!-- Link to Dashboard (requires login) -->
+  <a class="btn btn-primary m-2" href="{{ url_for('main.dashboard') }}">Dashboard</a>
+  
+  <!-- Link to HPC Module Generator -->
+  <a class="btn btn-secondary m-2" href="{{ url_for('main.generate_module') }}">Generate HPC Module</a>
+  
+  <!-- Link to Chat Page (make sure you have a corresponding route in your chatbot blueprint) -->
+  <a class="btn btn-info m-2" href="{{ url_for('chatbot.chat_page') }}">Chat with HPC Instructor</a>
+</div>
+{% endblock %}

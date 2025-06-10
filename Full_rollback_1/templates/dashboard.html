@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="container">
+  <h2 class="mt-3">Welcome, {{ user.name }}</h2>
+  <p>Your skill level: {{ user.skill_level }}</p>
+  <p>Your current progress: {{ user.progress }}%</p>
+
+  <!-- 🌟 Reward Feedback Section -->
+  {% if user.progress >= 80 %}
+    <p>🎉 You’ve earned a certificate! Download it now.</p>
+    <a href="{{ url_for('main.generate_certificate') }}" class="btn btn-success">Download Certificate</a>
+  {% elif user.progress >= 50 %}
+    <p>🏅 Keep going! You're halfway there.</p>
+  {% elif user.progress >= 25 %}
+    <p>🌱 You're making steady progress. Great work!</p>
+  {% else %}
+    <p>📘 Let’s begin your HPC journey. Answer questions to unlock progress!</p>
+  {% endif %}
+
+  <hr/>
+
+  <!-- 🔽 Select Concept -->
+  <form method="POST" action="{{ url_for('chatbot.start_concept') }}">
+    <label for="concept">Choose HPC Topic:</label>
+    <select name="concept" class="form-select mb-3">
+      <option value="Bash & Linux">Bash & Linux</option>
+      <option value="Slurm basics">Slurm basics</option>
+      <option value="MPI parallelism">MPI parallelism</option>
+      <option value="CUDA GPU">CUDA GPU</option>
+      <option value="Profiling tools">Profiling tools</option>
+    </select>
+    <button class="btn btn-primary">Start Learning</button>
+  </form>
+
+  <hr/>
+
+  <!-- 🏅 Badges Section -->
+  <h4>Your Badges</h4>
+  <ul>
+    {% for progress in current_user.progresses %}
+      <li>{{ progress.module_name }}: {{ progress.badge or "🏁 Not earned yet" }}</li>
+    {% endfor %}
+  </ul>
+
+  <hr/>
+
+  <!-- 💬 Chat History -->
+  <h4>Chat History</h4>
+  <ul>
+    {% for entry in user.get_response_history() %}
+      <li><strong>You:</strong> {{ entry.user }}<br>
+          <strong>Bot:</strong> {{ entry.chatbot }}</li>
+    {% endfor %}
+  </ul>
+</div>
+{% endblock %}

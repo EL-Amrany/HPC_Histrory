@@ -1,0 +1,9 @@
+<!-- templates/certificate.html -->
+{% extends "base.html" %}
+{% block content %}
+<div class="text-center">
+    <h1>Your HPC Certificate is Ready!</h1>
+    <p>Click the button below to download your certificate.</p>
+    <a class="btn btn-success" href="{{ url_for('main.generate_certificate') }}">Download Certificate</a>
+</div>
+{% endblock %}

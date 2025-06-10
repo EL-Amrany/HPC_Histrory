@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container py-4">
+  <h2 class="text-center mb-4">🧠 HPC Instructor Chatbot</h2>
+
+  <!-- Learning Info -->
+  <div class="mb-4">
+    <p><strong>📘 Current Topic:</strong> {{ session['lesson_state']['concept'] }}</p>
+    <p><strong>⭐ Your XP:</strong>
+      {% for progress in current_user.progresses %}
+        {% if progress.module_name == session['lesson_state']['concept'] %}
+          {{ progress.xp }} XP
+        {% endif %}
+      {% endfor %}
+    </p>
+    <p><strong>🏅 Badge:</strong>
+      {% for progress in current_user.progresses %}
+        {% if progress.module_name == session['lesson_state']['concept'] %}
+          {{ progress.badge or "🏁 Not earned yet" }}
+        {% endif %}
+      {% endfor %}
+    </p>
+  </div>
+
+  <!-- Chat Interface -->
+  <div id="chat-container" class="border rounded p-3 mb-3" style="height: 500px; overflow-y: auto; background-color: #f8f9fa;">
+    <div id="chat-history">
+      <!-- Messages will be appended here -->
+    </div>
+  </div>
+
+  <!-- Input -->
+  <div class="input-group">
+    <input type="text" id="user-input" class="form-control" placeholder="Type your message here..." autocomplete="off">
+    <button class="btn btn-primary" id="send-btn">Send</button>
+  </div>
+</div>
+
+<!-- Scripts -->
+<script>
+const sendBtn = document.getElementById('send-btn');
+const userInput = document.getElementById('user-input');
+const chatHistory = document.getElementById('chat-history');
+
+function addMessage(sender, message) {
+  const msgDiv = document.createElement('div');
+  msgDiv.className = sender === 'user' ? 'alert alert-secondary text-end' : 'alert alert-info text-start';
+  msgDiv.innerHTML = `<strong>${sender === 'user' ? 'You' : 'Bot'}:</strong><br>${message}`;
+  chatHistory.appendChild(msgDiv);
+  chatHistory.scrollTop = chatHistory.scrollHeight;
+}
+
+async function sendMessage(message = null) {
+  const userMsg = message || userInput.value.trim();
+  if (!userMsg && message === null) return;
+
+  if (message === null) {
+    addMessage('user', userMsg);
+    userInput.value = '';
+  }
+
+  try {
+    const response = await fetch('/chat/ask', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: userMsg })
+    });
+
+    const data = await response.json();
+    addMessage('bot', data.response);
+  } catch (err) {
+    addMessage('bot', '<em>⚠️ Something went wrong. Please try again.</em>');
+  }
+}
+
+// Trigger on button click or Enter key
+sendBtn.onclick = () => sendMessage();
+userInput.onkeyup = (e) => { if (e.key === 'Enter') sendMessage(); };
+
+// Auto-initiate chat
+window.addEventListener('DOMContentLoaded', () => {
+  sendMessage(""); // Start chat with explanation
+});
+</script>
+{% endblock %}

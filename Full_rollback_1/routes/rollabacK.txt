@@ -1,0 +1,1076 @@
+#routes/__init__.py
+# routes/__init__.py
+# This file can be empty or can contain package initialization logic
+
+#routes/auth.py
+from flask import Blueprint, render_template, request, redirect, url_for, flash
+from flask_login import login_user, logout_user, login_required
+from werkzeug.security import generate_password_hash, check_password_hash
+from app import db, login_manager
+from models.user import User
+
+auth_bp = Blueprint('auth', __name__, url_prefix='/auth')
+
+@auth_bp.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        email = request.form['email']
+        password = request.form['password']
+        user = User.query.filter_by(email=email).first()
+        if user and check_password_hash(user.password_hash, password):
+            login_user(user)
+            return redirect(url_for('main.dashboard'))
+        else:
+            flash('Invalid credentials', 'danger')
+            return redirect(url_for('auth.login'))
+
+    return render_template('login.html')
+
+
+@auth_bp.route('/signup', methods=['GET', 'POST'])
+def signup():
+    if request.method == 'POST':
+        name = request.form['name']
+        email = request.form['email']
+        password = request.form['password']
+        
+        # Check if user already exists
+        existing_user = User.query.filter_by(email=email).first()
+        if existing_user:
+            flash('User already exists.', 'danger')
+            return redirect(url_for('auth.signup'))
+        
+        # Create new user
+        hashed_pw = generate_password_hash(password, method="pbkdf2:sha256")
+        new_user = User(name=name, email=email, password_hash=hashed_pw)
+        db.session.add(new_user)
+        db.session.commit()
+        
+        flash('Signup successful! Please login.', 'success')
+        return redirect(url_for('auth.login'))
+
+    return render_template('signup.html')
+
+
+@auth_bp.route('/logout')
+@login_required
+def logout():
+    logout_user()
+    return redirect(url_for('main.index'))
+
+
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+
+
+#routes/chatbot.py
+from flask import Blueprint, request, jsonify, render_template, session, redirect, url_for
+from flask_login import login_required, current_user
+from app import db
+from utils.chat_logic import build_tutor_prompt
+from models.progress import Progress
+from langchain_openai import ChatOpenAI
+from langchain_community.document_loaders import DirectoryLoader
+from langchain.indexes import VectorstoreIndexCreator
+from langchain_openai import OpenAIEmbeddings
+from markupsafe import Markup
+import re
+from markdown import markdown
+
+# Load documents
+loader = DirectoryLoader("data/")
+embeddings = OpenAIEmbeddings(api_key="sk-proj-Kl1lflhbwL0QhXOnzJ1UT3BlbkFJoqsfEVjW0uZyLwo2DCVr")
+index_creator = VectorstoreIndexCreator(embedding=embeddings)
+index = index_creator.from_loaders([loader])
+
+llm = ChatOpenAI(
+    model="gpt-4o",
+    openai_api_key="sk-proj-Kl1lflhbwL0QhXOnzJ1UT3BlbkFJoqsfEVjW0uZyLwo2DCVr",
+)
+
+chatbot_bp = Blueprint('chatbot', __name__, url_prefix='/chat')
+
+@chatbot_bp.route('/')
+@login_required
+def chat_page():
+    return render_template("chat.html")
+
+@chatbot_bp.route('/start_concept', methods=['POST'])
+@login_required
+def start_concept():
+    concept = request.form.get('concept')
+    session['lesson_state'] = {
+        'stage': 'explain',
+        'concept': concept,
+        'retry_count': 0,
+        'rewards': 0,
+        'xp': 0,
+        'completed': [],
+        'history': [],
+        'current_question': '',
+        'correct_answer': '',
+        'correct_text': ''
+    }
+    return redirect(url_for('chatbot.chat_page'))
+
+def explain(concept, state, feedback=''):
+    prompt = f"""
+    You are an interactive HPC tutor. Explain the concept '{concept}' clearly, including:
+    - Include this sentence in the first line : {feedback}
+    - A full paragraph of explanation
+    - One step-by-step example
+    - End with a multiple choice question (A to D)
+
+    Internally, include the correct answer on the last line like: Answer: B
+    (This line will be parsed but never shown to the user)
+    include this sentence at the end : provide a one letter answer
+
+    Provide the entire module directly as HTML only. Do not add markdown or backticks.
+    """
+    response_raw = index.query(prompt, llm=llm)
+
+    # Extract answer letter and clean response
+    answer_match = re.search(r"answer:\s*([a-d])", response_raw, re.IGNORECASE)
+    correct_letter = answer_match.group(1).lower() if answer_match else 'a'
+    cleaned_response = re.sub(r"answer:\s*[a-d]", "", response_raw, flags=re.IGNORECASE).strip()
+
+    # Extract full correct answer text
+    option_match = re.search(rf"{correct_letter.upper()}\)\s*(.*?)\s*(?:[A-D]\)|$)", cleaned_response, re.IGNORECASE)
+    correct_text = option_match.group(1).strip().lower() if option_match else ''
+
+    # Update state
+    state.update({
+        'stage': 'awaiting_answer',
+        'current_question': cleaned_response,
+        'correct_answer': correct_letter,
+        'correct_text': correct_text,
+        'retry_count': 0
+    })
+
+    return Markup(markdown(cleaned_response))
+
+def is_correct_answer(user_input, correct_letter, correct_text):
+    user_input = user_input.strip().lower()
+    correct_letter = correct_letter.strip().lower()
+    correct_text = correct_text.strip().lower()
+
+    user_input_clean = re.sub(r"[^\w\s]", "", user_input)
+
+    if user_input_clean == correct_letter:
+        return True
+
+
+    patterns = [
+        rf"\b{correct_letter}\b",
+        rf"option\s+{correct_letter}",
+        rf"answer\s+(is\s+)?{correct_letter}",
+        rf"i\s+choose\s+{correct_letter}",
+        rf"i\s+think\s+(it's\s+)?{correct_letter}"
+    ]
+    for pattern in patterns:
+        if re.search(pattern, user_input_clean):
+            return True
+
+    if correct_text in user_input:
+        return True
+
+    return False
+
+def is_correct_answer(user_input, correct_letter, correct_text):
+    input_clean = user_input.lower().strip(".) ")
+    return input_clean == correct_letter.lower()
+
+@chatbot_bp.route('/ask', methods=['POST'])
+@login_required
+def ask():
+    data = request.get_json()
+    user_input = data.get('message', '').strip()
+
+    state = session.get('lesson_state', {})
+    stage = state.get('stage', 'explain')
+    concept = state.get('concept', 'SLURM basics')
+    retry_count = state.get('retry_count', 0)
+    rewards = state.get('rewards', 0)
+    history = state.get('history', [])
+    response_html=''
+
+    if state['stage'] == 'explain':
+        response_html = explain(concept, state)
+        history.append({'bot': response_html})
+
+    elif state['stage'] == 'awaiting_answer':
+        correct_letter = state.get('correct_answer', 'a')
+        correct_text = state.get('correct_text', '')
+
+        if is_correct_answer(user_input, correct_letter, correct_text):
+            rewards += 1
+            current_user.progress += 5
+            db.session.commit()
+
+            progress = Progress.query.filter_by(user_id=current_user.id, module_name=concept).first()
+            if not progress:
+                progress = Progress(user_id=current_user.id, module_name=concept)
+                db.session.add(progress)
+            if progress.xp is None:
+                progress.xp = 0
+
+            progress.xp += 5
+            progress.completion_percentage = min(progress.xp, 100)
+
+            if progress.xp >= 30:
+                progress.badge = "🥇 HPC Hero"
+            elif progress.xp >= 15:
+                progress.badge = "🥈 Slurm Star"
+            elif progress.xp >= 5:
+                progress.badge = "🥉 Bash Beginner"
+
+            db.session.commit()
+
+            state.setdefault('completed', []).append(concept)
+
+            if len(state['completed']) >= 3:
+                feedback = "✅ **Correct!** 🎉 You’ve completed 3 modules! Consider downloading your certificate."
+            else:
+                feedback = "✅ **Correct!** Here's your next concept!"
+
+            history.append({'bot': Markup(markdown(feedback))})
+
+            # Move on to next concept
+            state['stage'] = 'explain'
+            
+            response_html = explain(concept, state,feedback)
+
+        else:
+            
+            retry_count += 1
+            if retry_count <2 :
+                
+                state['retry_count'] = retry_count
+                response_html = Markup(markdown("❌ Try again! .**"))
+
+            else:
+                state['stage'] = 'review'
+                
+
+
+
+
+    if state['stage'] == 'review':
+        prompt = f" Include the sentence in the biginning (❌ That's not quite right let's review the concept!) .and Re-explain '{concept}' simply with a basic example. Then ask the same MCQ: {state['current_question']} but do not include this feedback now  (Correct! Here's your next concept!)"
+        response_raw = index.query(prompt, llm=llm)
+        state['stage'] = 'awaiting_answer'
+        response_html = Markup(markdown(response_raw))
+
+    state['rewards'] = rewards
+    state['history'] = history
+    session['lesson_state'] = state
+
+    return jsonify({"response": str(response_html)})
+
+
+
+
+#routes/main.py
+from flask import Blueprint, render_template, request, redirect, url_for, send_file
+from flask_login import login_required, current_user
+from models.user import User
+from app import db
+from utils.pdf_generator import generate_certificate_pdf
+
+main_bp = Blueprint('main', __name__)
+
+@main_bp.route('/')
+def index():
+    # Public homepage or welcome page
+    return render_template('index.html')
+
+@main_bp.route('/dashboard')
+@login_required
+def dashboard():
+    # Show user progress, HPC modules, next recommended steps, etc.
+    return render_template('dashboard.html', user=current_user)
+
+@main_bp.route("/generate")
+def generate_module():
+    return render_template("generate.html")
+
+
+@main_bp.route('/generate_certificate')
+@login_required
+def generate_certificate():
+    # Only generate if progress >= 100, or some threshold
+    if current_user.progress >= 80.0:
+        pdf_path = generate_certificate_pdf(current_user)
+        return send_file(pdf_path, as_attachment=True)
+    else:
+        return "You have not completed enough progress to earn a certificate."
+
+
+#routes/rollback.py
+
+from flask import Blueprint, request, jsonify, render_template, session, redirect, url_for
+from flask_login import login_required, current_user
+from app import db
+from utils.chat_logic import build_tutor_prompt
+from models.progress import Progress
+from langchain_openai import ChatOpenAI
+from langchain_community.document_loaders import DirectoryLoader
+from langchain.indexes import VectorstoreIndexCreator
+from langchain_openai import OpenAIEmbeddings
+from markupsafe import Markup
+import re
+from markdown import markdown
+
+
+# Initialize vector index
+# Load HPC documents
+loader = DirectoryLoader("data/")
+embeddings = OpenAIEmbeddings(api_key="sk-proj-Kl1lflhbwL0QhXOnzJ1UT3BlbkFJoqsfEVjW0uZyLwo2DCVr")
+index_creator = VectorstoreIndexCreator(embedding=embeddings)
+index = index_creator.from_loaders([loader])
+
+llm = ChatOpenAI(
+    model="gpt-4o",
+    openai_api_key="sk-proj-Kl1lflhbwL0QhXOnzJ1UT3BlbkFJoqsfEVjW0uZyLwo2DCVr",
+)
+
+chatbot_bp = Blueprint('chatbot', __name__, url_prefix='/chat')
+
+@chatbot_bp.route('/')
+@login_required
+def chat_page():
+    return render_template("chat.html")
+
+@chatbot_bp.route('/start_concept', methods=['POST'])
+@login_required
+def start_concept():
+    concept = request.form.get('concept')
+    session['lesson_state'] = {
+        'stage': 'explain',
+        'concept': concept,
+        'retry_count': 0,
+        'rewards': 0,
+        'xp': 0,
+        'completed': [],
+        'history': [],
+        'current_question': '',
+        'correct_answer': ''
+    }
+    return redirect(url_for('chatbot.chat_page'))
+@chatbot_bp.route('/ask', methods=['POST'])
+@login_required
+def ask():
+    data = request.get_json()
+    user_input = data.get('message', '').strip().lower()
+
+    state = session.get('lesson_state', {})
+    stage = state.get('stage', 'explain')
+    concept = state.get('concept', 'SLURM basics')
+    retry_count = state.get('retry_count', 0)
+    rewards = state.get('rewards', 0)
+    history = state.get('history', [])
+
+    if stage == 'explain':
+        prompt = f"""
+        You are an interactive HPC tutor. Explain the concept '{concept}' clearly, including:
+        - A full paragraph of explanation
+        - One step-by-step example
+        - End with a multiple choice question (A to D) 
+
+        Internally, include the correct answer on the last line like: Answer: B
+        (This line will be parsed but never shown to the user)
+        include this sentence at the end : provide a one letter answer
+        
+        Provide the entire module directly as HTML only. Do not add markdown or backticks.
+        """
+
+        response_raw = index.query(prompt, llm=llm)
+
+        # Extract and remove the answer line
+        answer_match = re.search(r"answer:\s*([a-d])", response_raw, re.IGNORECASE)
+        correct_answer = answer_match.group(1).lower() if answer_match else 'a'
+        cleaned_response = re.sub(r"answer:\s*[a-d]", "", response_raw, flags=re.IGNORECASE).strip()
+
+        # Optional: Parse and reformat question
+        question_match = re.search(r"(question:.*?)(a\).+?b\).+?c\).+?d\).+)", cleaned_response, re.IGNORECASE | re.DOTALL)
+        if question_match:
+            question_text = question_match.group(1).strip()
+            choices_text = question_match.group(2).strip()
+            full_question = f"{question_text} {choices_text}"
+        else:
+            full_question = "What is Slurm? A) ... B) ... C) ... D)"
+
+        state.update({
+            'stage': 'awaiting_answer',
+            'current_question': full_question,
+            'correct_answer': correct_answer,
+            'retry_count': 0
+        })
+
+        response_html = Markup(markdown(cleaned_response))
+        history.append({'bot': response_html})
+
+    elif stage == 'awaiting_answer':
+        correct = state.get('correct_answer', 'a')
+
+        def is_correct_answer(user_input, correct):
+            input_clean = user_input.lower().strip(".) ")
+            return input_clean == correct.lower()
+
+        if is_correct_answer(user_input, correct):
+            rewards += 1
+            current_user.progress += 5
+            db.session.commit()
+
+            progress = Progress.query.filter_by(user_id=current_user.id, module_name=concept).first()
+            if not progress:
+                progress = Progress(user_id=current_user.id, module_name=concept)
+                db.session.add(progress)
+            if progress.xp is None:
+                progress.xp = 0
+
+            progress.xp += 5
+            progress.completion_percentage = min(progress.xp, 100)
+
+            if progress.xp >= 30:
+                progress.badge = "🥇 HPC Hero"
+            elif progress.xp >= 15:
+                progress.badge = "🥈 Slurm Star"
+            elif progress.xp >= 5:
+                progress.badge = "🥉 Bash Beginner"
+
+            db.session.commit()
+
+            if concept not in state.get('completed', []):
+                state.setdefault('completed', []).append(concept)
+
+            if len(state['completed']) >= 3:
+                response_raw = "✅ **Correct!** 🎉 You’ve completed 3 modules! Consider downloading your certificate."
+            else:
+                response_raw = "✅ **Correct!** Let's move on to the next step."
+
+            state['stage'] = 'explain'
+        else:
+            retry_count += 1
+            if retry_count >= 2:
+                state['stage'] = 'review'
+                response_raw = "❌ That's not quite right. **Let's review the concept.**"
+            else:
+                state['stage'] = 'awaiting_answer'
+                response_raw = "❌ Try again! **Focus on the key explanation.**"
+
+        state['rewards'] = rewards
+        state['retry_count'] = retry_count
+        response_html = Markup(markdown(response_raw))
+
+    elif stage == 'review':
+        prompt = f"Re-explain '{concept}' simply with a basic example. Then ask the same MCQ: {state['current_question']}"
+        response_raw = index.query(prompt, llm=llm)
+        state['stage'] = 'awaiting_answer'
+        response_html = Markup(markdown(response_raw))
+
+    state['history'] = history
+    session['lesson_state'] = state
+
+    return jsonify({"response": str(response_html)})
+
+#static/js/chat.js
+document.getElementById('send-btn').addEventListener('click', sendMessage);
+
+function sendMessage() {
+    const userInput = document.getElementById('user-input');
+    const message = userInput.value.trim();
+    if (!message) return;
+
+    appendToChat("You", message);
+    userInput.value = "";
+
+    fetch('/chat/ask', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: message })
+    })
+    .then(response => response.json())
+    .then(data => {
+        appendToChat("Bot", data.answer);
+    })
+    .catch(err => console.error(err));
+}
+
+function appendToChat(sender, text) {
+    const chatBox = document.getElementById('chat-box');
+    const p = document.createElement('p');
+    p.innerHTML = `<strong>${sender}:</strong> ${text}`;
+    chatBox.appendChild(p);
+    chatBox.scrollTop = chatBox.scrollHeight;
+}
+
+
+#templates/base.html
+<!-- templates/base.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>HPC Learning App</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+
+    <nav class="navbar navbar-expand-lg navbar-light bg-light">
+        <div class="container-fluid">
+          <a class="navbar-brand" href="{{ url_for('main.index') }}">HPC App</a>
+          <div class="collapse navbar-collapse">
+            <ul class="navbar-nav ms-auto">
+                {% if current_user.is_authenticated %}
+                <li class="nav-item">
+                  <a class="nav-link" href="{{ url_for('main.dashboard') }}">Dashboard</a>
+                </li>
+                <li class="nav-item">
+                  <a class="nav-link" href="{{ url_for('chatbot.chat_page') }}">Chat</a>
+                </li>
+                <li class="nav-item">
+                  <a class="nav-link" href="{{ url_for('main.generate_module') }}">Generate Module</a>
+                </li>
+                <li class="nav-item">
+                  <a class="nav-link" href="{{ url_for('auth.logout') }}">Logout</a>
+                </li>
+              {% else %}
+                <li class="nav-item">
+                  <a class="nav-link" href="{{ url_for('auth.login') }}">Login</a>
+                </li>
+                <li class="nav-item">
+                  <a class="nav-link" href="{{ url_for('auth.signup') }}">Signup</a>
+                </li>
+              {% endif %}
+              
+
+            </ul>
+          </div>
+        </div>
+      </nav>
+      
+
+<div class="container mt-4">
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      {% for category, msg in messages %}
+        <div class="alert alert-{{ category }}" role="alert">
+          {{ msg }}
+        </div>
+      {% endfor %}
+    {% endif %}
+  {% endwith %}
+  
+  {% block content %}{% endblock %}
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
+
+
+#templates/certificate.html
+<!-- templates/certificate.html -->
+{% extends "base.html" %}
+{% block content %}
+<div class="text-center">
+    <h1>Your HPC Certificate is Ready!</h1>
+    <p>Click the button below to download your certificate.</p>
+    <a class="btn btn-success" href="{{ url_for('main.generate_certificate') }}">Download Certificate</a>
+</div>
+{% endblock %}
+
+
+#templates/chat.html
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container py-4">
+  <h2 class="text-center mb-4">🧠 HPC Instructor Chatbot</h2>
+
+  <!-- Learning Info -->
+  <div class="mb-4">
+    <p><strong>📘 Current Topic:</strong> {{ session['lesson_state']['concept'] }}</p>
+    <p><strong>⭐ Your XP:</strong>
+      {% for progress in current_user.progresses %}
+        {% if progress.module_name == session['lesson_state']['concept'] %}
+          {{ progress.xp }} XP
+        {% endif %}
+      {% endfor %}
+    </p>
+    <p><strong>🏅 Badge:</strong>
+      {% for progress in current_user.progresses %}
+        {% if progress.module_name == session['lesson_state']['concept'] %}
+          {{ progress.badge or "🏁 Not earned yet" }}
+        {% endif %}
+      {% endfor %}
+    </p>
+  </div>
+
+  <!-- Chat Interface -->
+  <div id="chat-container" class="border rounded p-3 mb-3" style="height: 500px; overflow-y: auto; background-color: #f8f9fa;">
+    <div id="chat-history">
+      <!-- Messages will be appended here -->
+    </div>
+  </div>
+
+  <!-- Input -->
+  <div class="input-group">
+    <input type="text" id="user-input" class="form-control" placeholder="Type your message here..." autocomplete="off">
+    <button class="btn btn-primary" id="send-btn">Send</button>
+  </div>
+</div>
+
+<!-- Scripts -->
+<script>
+const sendBtn = document.getElementById('send-btn');
+const userInput = document.getElementById('user-input');
+const chatHistory = document.getElementById('chat-history');
+
+function addMessage(sender, message) {
+  const msgDiv = document.createElement('div');
+  msgDiv.className = sender === 'user' ? 'alert alert-secondary text-end' : 'alert alert-info text-start';
+  msgDiv.innerHTML = `<strong>${sender === 'user' ? 'You' : 'Bot'}:</strong><br>${message}`;
+  chatHistory.appendChild(msgDiv);
+  chatHistory.scrollTop = chatHistory.scrollHeight;
+}
+
+async function sendMessage(message = null) {
+  const userMsg = message || userInput.value.trim();
+  if (!userMsg && message === null) return;
+
+  if (message === null) {
+    addMessage('user', userMsg);
+    userInput.value = '';
+  }
+
+  try {
+    const response = await fetch('/chat/ask', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: userMsg })
+    });
+
+    const data = await response.json();
+    addMessage('bot', data.response);
+  } catch (err) {
+    addMessage('bot', '<em>⚠️ Something went wrong. Please try again.</em>');
+  }
+}
+
+// Trigger on button click or Enter key
+sendBtn.onclick = () => sendMessage();
+userInput.onkeyup = (e) => { if (e.key === 'Enter') sendMessage(); };
+
+// Auto-initiate chat
+window.addEventListener('DOMContentLoaded', () => {
+  sendMessage(""); // Start chat with explanation
+});
+</script>
+{% endblock %}
+
+
+#templates/dashboard.html
+{% extends "base.html" %}
+{% block content %}
+<div class="container">
+  <h2 class="mt-3">Welcome, {{ user.name }}</h2>
+  <p>Your skill level: {{ user.skill_level }}</p>
+  <p>Your current progress: {{ user.progress }}%</p>
+
+  <!-- 🌟 Reward Feedback Section -->
+  {% if user.progress >= 80 %}
+    <p>🎉 You’ve earned a certificate! Download it now.</p>
+    <a href="{{ url_for('main.generate_certificate') }}" class="btn btn-success">Download Certificate</a>
+  {% elif user.progress >= 50 %}
+    <p>🏅 Keep going! You're halfway there.</p>
+  {% elif user.progress >= 25 %}
+    <p>🌱 You're making steady progress. Great work!</p>
+  {% else %}
+    <p>📘 Let’s begin your HPC journey. Answer questions to unlock progress!</p>
+  {% endif %}
+
+  <hr/>
+
+  <!-- 🔽 Select Concept -->
+  <form method="POST" action="{{ url_for('chatbot.start_concept') }}">
+    <label for="concept">Choose HPC Topic:</label>
+    <select name="concept" class="form-select mb-3">
+      <option value="Bash & Linux">Bash & Linux</option>
+      <option value="Slurm basics">Slurm basics</option>
+      <option value="MPI parallelism">MPI parallelism</option>
+      <option value="CUDA GPU">CUDA GPU</option>
+      <option value="Profiling tools">Profiling tools</option>
+    </select>
+    <button class="btn btn-primary">Start Learning</button>
+  </form>
+
+  <hr/>
+
+  <!-- 🏅 Badges Section -->
+  <h4>Your Badges</h4>
+  <ul>
+    {% for progress in current_user.progresses %}
+      <li>{{ progress.module_name }}: {{ progress.badge or "🏁 Not earned yet" }}</li>
+    {% endfor %}
+  </ul>
+
+  <hr/>
+
+  <!-- 💬 Chat History -->
+  <h4>Chat History</h4>
+  <ul>
+    {% for entry in user.get_response_history() %}
+      <li><strong>You:</strong> {{ entry.user }}<br>
+          <strong>Bot:</strong> {{ entry.chatbot }}</li>
+    {% endfor %}
+  </ul>
+</div>
+{% endblock %}
+
+
+#templates/generate.html
+<!-- templates/generate.html -->
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container">
+  <h2>Adaptive HPC Module Generator</h2>
+  <form method="post">
+    <textarea name="skills" placeholder="Enter known skills"></textarea>
+    <button type="submit">Generate Module</button>
+  </form>
+</div>
+{% endblock %}
+
+
+#templates/index.html
+{% extends "base.html" %}
+
+{% block content %}
+<div class="text-center mt-5">
+  <h1>Welcome to the HPC Learning App</h1>
+  <p>Explore and learn High-Performance Computing at your own pace.</p>
+  
+  <!-- Link to Dashboard (requires login) -->
+  <a class="btn btn-primary m-2" href="{{ url_for('main.dashboard') }}">Dashboard</a>
+  
+  <!-- Link to HPC Module Generator -->
+  <a class="btn btn-secondary m-2" href="{{ url_for('main.generate_module') }}">Generate HPC Module</a>
+  
+  <!-- Link to Chat Page (make sure you have a corresponding route in your chatbot blueprint) -->
+  <a class="btn btn-info m-2" href="{{ url_for('chatbot.chat_page') }}">Chat with HPC Instructor</a>
+</div>
+{% endblock %}
+
+
+#templates/login.html
+{% extends "base.html" %}
+{% block content %}
+<div class="container" style="max-width:400px; margin-top:50px;">
+  <h2>Login</h2>
+  <form method="POST" action="{{ url_for('auth.login') }}">
+    <div class="mb-3">
+      <label>Email</label>
+      <input type="email" name="email" class="form-control" required />
+    </div>
+    <div class="mb-3">
+      <label>Password</label>
+      <input type="password" name="password" class="form-control" required />
+    </div>
+    <button type="submit" class="btn btn-primary">Login</button>
+  </form>
+  <p class="mt-3">Don't have an account? <a href="{{ url_for('auth.signup') }}">Sign up</a></p>
+</div>
+{% endblock %}
+
+
+#templates/signup.html
+{% extends "base.html" %}
+{% block content %}
+<div class="container" style="max-width:400px; margin-top:50px;">
+  <h2>Sign Up</h2>
+  <form method="POST" action="{{ url_for('auth.signup') }}">
+    <div class="mb-3">
+      <label>Name</label>
+      <input type="text" name="name" class="form-control" required />
+    </div>
+    <div class="mb-3">
+      <label>Email</label>
+      <input type="email" name="email" class="form-control" required />
+    </div>
+    <div class="mb-3">
+      <label>Password</label>
+      <input type="password" name="password" class="form-control" required />
+    </div>
+    <button type="submit" class="btn btn-primary">Sign Up</button>
+  </form>
+</div>
+{% endblock %}
+
+
+
+#utils/chat_logic.py
+import os
+from langchain_community.document_loaders import DirectoryLoader
+from langchain.indexes import VectorstoreIndexCreator
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from dotenv import load_dotenv
+
+# Make sure you do this early!
+load_dotenv()
+
+
+
+# Load HPC documents
+loader = DirectoryLoader("data/")
+embeddings = OpenAIEmbeddings(api_key="sk-proj-Kl1lflhbwL0QhXOnzJ1UT3BlbkFJoqsfEVjW0uZyLwo2DCVr")
+index_creator = VectorstoreIndexCreator(embedding=embeddings)
+index = index_creator.from_loaders([loader])
+
+llm = ChatOpenAI(
+    model="gpt-3.5-turbo",
+    openai_api_key="sk-proj-Kl1lflhbwL0QhXOnzJ1UT3BlbkFJoqsfEVjW0uZyLwo2DCVr",
+) 
+
+def get_chatbot_response(user_message, skill_level, progress):
+    """
+    Return an adaptive HPC response based on user skill_level and progress.
+    You can refine the logic to produce simpler or more complex answers.
+    """
+
+    # Example: add some dynamic instructions
+    if skill_level == 'beginner':
+        difficulty_instruction = "Explain as if you are teaching someone new to HPC. Keep it simple."
+    elif skill_level == 'intermediate':
+        difficulty_instruction = "Provide more in-depth explanations and some HPC-specific commands or code."
+    else:  # advanced
+        difficulty_instruction = "Offer advanced concepts, performance tuning tips, etc."
+
+    # Build prompt for the LLM
+    custom_prompt = f"""
+    You are an HPC instructor. The user has a skill level = {skill_level}, progress = {progress}.
+    {difficulty_instruction}
+
+    User's question: {user_message}
+
+    Answer thoroughly, referencing HPC best practices, but keep it concise.
+    """
+
+    # Query the vector index of HPC docs for context
+    response = index.query(custom_prompt, llm=llm)
+
+    return response
+
+def build_adaptive_learning_prompt(user_history, skill_level="beginner"):
+    prompt = f"""
+    You are an adaptive HPC instructor chatbot teaching a student at the {skill_level} level. 
+    Your goal is to teach HPC gradually, adjusting complexity based on the user's answers.
+    
+    Follow these steps strictly:
+    
+    1. Provide a concise explanation of a fundamental HPC concept appropriate for their skill level.
+    2. Immediately ask one comprehension question about this concept to test the student's understanding. 
+       - Clearly state: "Question:" followed by the question.
+       - Provide multiple-choice answers labeled clearly as (A), (B), (C), (D).
+    3. Wait for the student's response before proceeding further.
+    
+    Here’s the conversation so far for context:
+    {user_history}
+
+    Now, proceed as instructed.
+    """
+    return prompt
+
+
+def build_tutor_prompt(history, concept, skill_level):
+    return f"""
+You are an interactive tutor teaching High-Performance Computing (HPC).
+The student is a {skill_level} learner.
+
+Your current concept: "{concept}"
+
+1. Begin by clearly explaining this concept at their skill level.
+2. Immediately follow up with a multiple-choice question (labelled A, B, C, D) to check understanding.
+3. Do NOT answer the question. Only present it.
+4. Use <strong> key terms </strong>, <code>example snippets</code>, and clear steps.
+
+Previous context:
+{history}
+
+Now proceed.
+"""
+
+def get_quiz_question(concept):
+    return f"Ask one multiple choice quiz about {concept} with labeled choices A to D and only one correct answer."
+
+
+from langchain_openai import ChatOpenAI
+from langchain.indexes import VectorstoreIndexCreator
+from langchain_community.document_loaders import DirectoryLoader
+from langchain_openai import OpenAIEmbeddings
+
+
+
+
+def evaluate_answer_with_llm(user_response, expected_question):
+    """
+    Evaluates if a user's response to a question is correct using the LLM.
+    Returns a tuple: (True/False, feedback string)
+    """
+    evaluation_prompt = f"""
+You are an HPC tutor evaluating a student's response to a quiz.
+
+Question: {expected_question}
+Student Answer: {user_response}
+
+Respond in this format:
+1. "correct" or "incorrect" at the start.
+2. Then give a one-line explanation or suggestion.
+
+Example:
+correct: Yes, SLURM is used to submit and manage jobs on HPC clusters.
+
+Now evaluate the student's answer:
+"""
+
+    response = llm.predict(evaluation_prompt).strip().lower()
+
+    if response.startswith("correct"):
+        return True, response
+    elif response.startswith("incorrect"):
+        return False, response
+    else:
+        return False, "unclear: I couldn’t evaluate your answer. Try rephrasing."
+
+def extract_question(response):
+    import re
+    match = re.search(r"Question:(.*?)(?:\n|$)", response)
+    return match.group(1).strip() if match else ""
+
+
+def get_next_concept(current):
+    concepts = [
+        "What is HPC?",
+        "What is a cluster?",
+        "SLURM basics",
+        "Running jobs on ULHPC",
+        "Bash scripting basics"
+    ]
+    try:
+        index = concepts.index(current)
+        return concepts[(index + 1) % len(concepts)]
+    except ValueError:
+        return "What is HPC?"
+
+
+#utils/pdf_generator.py
+import pdfkit
+import os
+from datetime import datetime
+
+def generate_certificate_pdf(user):
+    # Create a simple HTML for certificate
+    certificate_html = f"""
+    <html>
+    <head>
+        <meta charset="utf-8" />
+        <title>HPC Completion Certificate</title>
+    </head>
+    <body style="text-align:center; padding:50px;">
+        <h1>Certificate of Completion</h1>
+        <p>This certifies that <strong>{user.name}</strong> has successfully completed</p>
+        <p>the HPC training at a mastery level of <strong>{user.skill_level}</strong></p>
+        <p>on {datetime.now().strftime('%Y-%m-%d')} with a progress of {user.progress:.2f}%.</p>
+        <p>Congratulations!</p>
+    </body>
+    </html>
+    """
+
+    pdf_path = f"/tmp/{user.name}_certificate.pdf"  # or any path you prefer
+    pdfkit.from_string(certificate_html, pdf_path)
+    return pdf_path
+
+
+#app.py
+from flask import Flask
+from flask_login import LoginManager
+from config import Config
+
+from extensions import db   # <-- import here instead of from app
+
+login_manager = LoginManager()
+
+def create_app():
+    app = Flask(__name__)
+    app.config.from_object(Config)
+    
+    db.init_app(app)
+    login_manager.init_app(app)
+    login_manager.login_view = 'auth.login'
+    
+    # Import models AFTER db.init_app so no loop
+    from models.user import User
+    from models.progress import Progress
+    
+    # Register blueprints
+    from routes.auth import auth_bp
+    from routes.main import main_bp
+    from routes.chatbot import chatbot_bp
+    
+    app.register_blueprint(auth_bp)
+    app.register_blueprint(main_bp)
+    app.register_blueprint(chatbot_bp)
+    
+    with app.app_context():
+        db.create_all()
+    
+    return app
+
+
+#config.py
+import os
+from dotenv import load_dotenv
+
+load_dotenv()  # Load variables from .env
+
+class Config:
+    SECRET_KEY = os.environ.get('SECRET_KEY', 'dev_secret_key')
+    SQLALCHEMY_DATABASE_URI = os.environ.get('DATABASE_URL', 'sqlite:///hpc_app.db')
+    SQLALCHEMY_TRACK_MODIFICATIONS = False
+    OPENAI_API_KEY = os.environ.get('sk-proj-Kl1lflhbwL0QhXOnzJ1UT3BlbkFJoqsfEVjW0uZyLwo2DCVr')
+
+
+#database.py
+# database.py
+from app import create_app, db
+
+app = create_app()
+
+with app.app_context():
+    # Drop existing tables
+    db.drop_all()
+    # Create fresh tables
+    db.create_all()
+    print("Database reset complete.")
+
+
+#extensions.py
+# extensions.py
+from flask_sqlalchemy import SQLAlchemy
+
+db = SQLAlchemy()
+
+
+#run.py
+from app import create_app
+
+app = create_app()
+
+if __name__ == "__main__":
+    app.run(debug=True)
+
+
